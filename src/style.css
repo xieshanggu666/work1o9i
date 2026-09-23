@@ -1,0 +1,7 @@
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;background:#0a1224;color:#dbe4f3;}
+#app{min-height:100vh;}
+button{font-family:inherit;}
+::-webkit-scrollbar{width:8px;height:8px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:#1a2a4a;border-radius:5px;}
