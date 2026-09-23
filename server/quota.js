@@ -31,6 +31,40 @@ let stmts
 // 通过注入回调写日志/通知，避免与 index.js 循环依赖
 let notify = () => {}
 
+// ===== 周期用量累计表 =====
+// energy_records 明细只保留 7 天，而周/月周期窗口可达 7/31 天，周期用量不能
+// 每次都从明细实时聚合——否则月初的用电会随明细清理陆续「蒸发」，月累计
+// 单调缩水，评估器据此把仍在超标的告警误判为「用量回落」而自动解除。
+// 这里对每条已结明细只消费一次（游标水位 = 已入账的最大 record id，单调前进），
+// 按与周期窗口的重叠时长分摊追加到 quota_usage 桶；桶内累计不随明细删除减少。
+// 周期用量 = 桶内已累计（全部已结明细）+ 未结运行段实时折算（沿用既有口径）。
+// 额度删除不清理累计桶：周期已结束的桶作为历史留存，重建同配置额度仍可追溯。
+//
+// 首次迁移全量回填时，库里若已发生过明细清理（月初明细已不存在），用该桶对应
+// 周期的历史告警 used_kwh 快照作为兜底下限（MAX）：快照只可能略大于真实值
+// （含过不超过一次未结段实时折算、上限 1h 运行电量），绝不会把已超标的周期
+// 兜底成未超标，避免既有库升级后误解除/不重开。
+function migrateUsageTables() {
+  db.exec(`
+  CREATE TABLE IF NOT EXISTS quota_usage (
+    quota_id INTEGER NOT NULL,            -- 额度删除后桶仍保留（历史留存）
+    period TEXT NOT NULL,                 -- daily / weekly / monthly
+    period_start TEXT NOT NULL,           -- 周期起点（本地零点 ISO）
+    period_end TEXT NOT NULL,
+    settled_kwh REAL NOT NULL DEFAULT 0,  -- 已结明细按重叠时长分摊后的累计（只增不减）
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (quota_id, period, period_start)
+  );
+  CREATE TABLE IF NOT EXISTS quota_usage_cursors (
+    quota_id INTEGER NOT NULL,
+    period TEXT NOT NULL,                 -- 额度换周期时删除新粒度游标 → 触发该粒度全量回填
+    last_record_id INTEGER NOT NULL DEFAULT 0,  -- 已入账的最大 energy_records.id（水位线）
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (quota_id, period)
+  );
+  `)
+}
+
 // ===== 告警表建表 / 旧库迁移 =====
 // 旧版唯一键 UNIQUE(quota_id, period_start) 不含周期粒度：额度换周期且新旧窗口起点
 // 相同时（如周一 日→周），旧告警会被新周期窗口错误认领，沿用旧 period/阈值。
@@ -134,6 +168,7 @@ export function initQuota(database, notifyFn) {
   `)
   // 告警表：身份唯一键必须包含 period（额度调整周期后旧周期告警结存，新周期另立身份）
   migrateAlertsTable()
+  migrateUsageTables()
   stmts = {
     allQuotas: db.prepare('SELECT * FROM energy_quotas ORDER BY id'),
     quotaById: db.prepare('SELECT * FROM energy_quotas WHERE id=?'),
@@ -176,10 +211,41 @@ export function initQuota(database, notifyFn) {
     openAlerts: db.prepare("SELECT * FROM quota_alerts WHERE status IN ('open','handling')"),
     staleByQuota: db.prepare(`SELECT * FROM quota_alerts WHERE quota_id=? AND status IN ('open','handling')
                               AND (period<>? OR period_start<>?)`),
-    disabledByQuota: db.prepare("SELECT * FROM quota_alerts WHERE quota_id=? AND status IN ('open','handling')")
+    disabledByQuota: db.prepare("SELECT * FROM quota_alerts WHERE quota_id=? AND status IN ('open','handling')"),
+    // ===== 周期用量累计桶 / 消费游标 =====
+    getCursor: db.prepare('SELECT last_record_id FROM quota_usage_cursors WHERE quota_id=? AND period=?'),
+    // 增量：仅消费水位线之后、且已结束的新明细（end_time < now，剔除极端时钟错乱行）
+    newRecsRoom: db.prepare('SELECT * FROM energy_records WHERE id>? AND room=? AND end_time<=? ORDER BY id'),
+    newRecsDevice: db.prepare('SELECT * FROM energy_records WHERE id>? AND device_id=? AND end_time<=? ORDER BY id'),
+    // 全量回填：重新扫描与周期相关的全部现存明细（重建桶，不与旧值相加）
+    allRecsRoom: db.prepare('SELECT * FROM energy_records WHERE room=? ORDER BY id'),
+    allRecsDevice: db.prepare('SELECT * FROM energy_records WHERE device_id=? ORDER BY id'),
+    maxRecId: db.prepare('SELECT MAX(id) m FROM energy_records'),
+    // 回填兜底映射在 backfillExistingUsage 内按额度分组预构建（GROUP BY period_start）
+    upsertUsageAdd: db.prepare(`INSERT INTO quota_usage
+      (quota_id,period,period_start,period_end,settled_kwh,updated_at)
+      VALUES (?,?,?,?,?,?)
+      ON CONFLICT(quota_id,period,period_start) DO UPDATE SET
+        settled_kwh=settled_kwh+excluded.settled_kwh,
+        period_end=excluded.period_end, updated_at=excluded.updated_at`),
+    upsertUsageMax: db.prepare(`INSERT INTO quota_usage
+      (quota_id,period,period_start,period_end,settled_kwh,updated_at)
+      VALUES (?,?,?,?,?,?)
+      ON CONFLICT(quota_id,period,period_start) DO UPDATE SET
+        settled_kwh=MAX(settled_kwh,excluded.settled_kwh),
+        period_end=excluded.period_end, updated_at=excluded.updated_at`),
+    getUsage: db.prepare('SELECT settled_kwh FROM quota_usage WHERE quota_id=? AND period=? AND period_start=?'),
+    upsertCursor: db.prepare(`INSERT INTO quota_usage_cursors (quota_id,period,last_record_id,updated_at)
+      VALUES (?,?,?,?)
+      ON CONFLICT(quota_id,period) DO UPDATE SET last_record_id=excluded.last_record_id,updated_at=excluded.updated_at`),
+    delCursorPeriod: db.prepare('DELETE FROM quota_usage_cursors WHERE quota_id=? AND period=?'),
+    delUsagePeriod: db.prepare('DELETE FROM quota_usage WHERE quota_id=? AND period=?')
   }
 
   seedQuotas()
+  // 兼容旧库：为已有额度回填周期累计桶（现存明细全量重算 + 历史告警快照兜底
+  // 已被 7 天清理删除的部分），必须在首次评估前完成，避免缩水读数误解除告警
+  backfillExistingUsage(new Date())
   // 首次启动播种后立即评估一次，让看板开箱即有闭环演示数据
   evaluateAll(new Date())
   setInterval(() => { try { evaluateAll(new Date()) } catch (e) { console.error('[QUOTA] tick error', e) } }, TICK_MS)
@@ -207,7 +273,114 @@ export function periodRange(period, at = new Date()) {
   return { start, end }
 }
 
-// 当前周期已用电量 = 已结分段（按与周期窗口的重叠时长分摊）
+// 枚举一条已结明细按重叠时长覆盖到的周期窗口：日/周桶几乎总在整点对齐的
+// 单日内只命中一个桶；跨周期（跨零点/周一/月初）长段（旧库未拆行等）命中多个，
+// 按 功率等价的重叠时长比例 分别分摊。
+function periodWindowsCovered(period, startMs, endMs) {
+  const out = []
+  let { start, end } = periodRange(period, new Date(startMs))
+  // 防御：异常旧数据不参与分摊，限制循环上限避免脏行造成死循环
+  for (let guard = 0; start.getTime() < endMs && guard < 400; guard++) {
+    out.push({ startMs: start.getTime(), endMs: end.getTime() })
+    start = new Date(end)
+    end = nextPeriodEnd(period, start)
+  }
+  return out
+}
+
+function nextPeriodEnd(period, start) {
+  const end = new Date(start)
+  if (period === 'daily') end.setDate(end.getDate() + 1)
+  else if (period === 'weekly') end.setDate(end.getDate() + 7)
+  else end.setMonth(end.getMonth() + 1)
+  return end
+}
+
+// 把一条已结明细按与各周期窗口的重叠时长分摊入账（累计桶只增不减）
+function ingestRecord(q, rec, upsertStmt, atIso) {
+  const rStart = new Date(rec.start_time).getTime()
+  const rEnd = new Date(rec.end_time).getTime()
+  if (rEnd <= rStart) return
+  for (const w of periodWindowsCovered(q.period, rStart, rEnd)) {
+    const s = Math.max(rStart, w.startMs)
+    const e = Math.min(rEnd, w.endMs)
+    if (e <= s) continue
+    const kwh = round4(rec.kwh * ((e - s) / (rEnd - rStart)))
+    if (kwh <= 0) continue
+    upsertStmt.run(q.id, q.period, new Date(w.startMs).toISOString(),
+      new Date(w.endMs).toISOString(), kwh, atIso)
+  }
+}
+
+// 同步某额度某周期粒度的已结明细累计桶。
+// - 正常（游标存在）：增量消费水位线之后的新明细，游标只前进、桶只累加；
+//   明细被清理只影响尚未消费的行，已入账电量永久保留，周期累计不缩水。
+// - 无游标（新建额度 / 换周期后 / 首次迁移）：全量重扫现存明细重建该粒度各桶，
+//   游标直接推到当前最大 record id（避免之后增量重复入账）。floorMap 存在时
+//   （仅兼容旧库迁移）再用历史告警读数快照兜底已被清理删除的明细部分。
+function syncUsage(q, at = new Date(), { full = false, floorMap = null } = {}) {
+  if (!q.id) return
+  const atIso = at.toISOString()
+  const cursor = stmts.getCursor.get(q.id, q.period)
+  const fullScan = full || !cursor
+  const maxId = stmts.maxRecId.get().m ?? 0
+
+  if (fullScan) {
+    // 重建语义：先清掉该额度当前粒度的全部桶再重扫（换粒度不影响其他粒度旧桶），
+    // 保证回填可重复执行、绝不与既有值相加
+    stmts.delUsagePeriod.run(q.id, q.period)
+    const recs = q.scope === 'room'
+      ? stmts.allRecsRoom.all(q.target_name)
+      : stmts.allRecsDevice.all(q.device_id)
+    for (const r of recs) {
+      if (new Date(r.end_time).getTime() > at.getTime()) continue
+      ingestRecord(q, r, stmts.upsertUsageAdd, atIso)
+    }
+    if (floorMap) {
+      // 对每个有快照的历史周期取 MAX 兜底：即使该周期明细已全部被清理（扫描建不出桶），
+      // 也按快照建立累计桶，保证升级后仍超标的旧周期读数不塌、告警不被误解除。
+      // floorMap 仅含终点早于明细保留线的周期，进行中周期绝不在其中（避免重复折算）。
+      for (const [ps, floor] of Object.entries(floorMap)) {
+        if (floor == null) continue
+        const { end: pe } = periodRange(q.period, new Date(new Date(ps).getTime() + 3600_000))
+        stmts.upsertUsageMax.run(q.id, q.period, ps, pe.toISOString(), round4(floor), atIso)
+      }
+    }
+    stmts.upsertCursor.run(q.id, q.period, maxId, atIso)
+    return
+  }
+
+  const recs = q.scope === 'room'
+    ? stmts.newRecsRoom.all(cursor.last_record_id, q.target_name, atIso)
+    : stmts.newRecsDevice.all(cursor.last_record_id, q.device_id, atIso)
+  let watermark = cursor.last_record_id
+  for (const r of recs) {
+    ingestRecord(q, r, stmts.upsertUsageAdd, atIso)
+    // 水位线只推进到实际消费的行（查询已限定 end_time<=now）；极端时钟错乱
+    // 产生的未来行会在下一节拍「老化」后自然被补消费，绝不因水位线跳空而漏账
+    if (r.id > watermark) watermark = r.id
+  }
+  stmts.upsertCursor.run(q.id, q.period, watermark, atIso)
+}
+
+// 首次启动：为已有额度建立累计桶（全量回填现存明细 + 告警快照兜底被清理部分）
+function backfillExistingUsage(at = new Date()) {
+  for (const q of stmts.allQuotas.all()) {
+    // 每个周期起点取历史告警最大读数（含已解除/已处理）。旧版评估器的读数 =
+    // 现存明细分摊 + 未结段折算（≤1h 电量），周期内用量单调不减，故该最大值是
+    // 被 7 天清理删除部分的可靠下限：现存明细重算小于它时一律抬到快照值，
+    // 升级瞬间绝不把仍在超标的进行中周期误判为回落而解除告警。
+    // 快照可能含过至多 1h 实时折算，抬升后该周期用量最多高估 1h 电量（千分级），
+    // 且只影响当前这一个周期，跨期后从新桶重新累计。
+    const floorMap = {}
+    for (const a of db.prepare(
+      'SELECT period_start, MAX(used_kwh) m FROM quota_alerts WHERE quota_id=? AND period=? GROUP BY period_start'
+    ).all(q.id, q.period)) floorMap[a.period_start] = a.m
+    syncUsage(q, at, { full: true, floorMap })
+  }
+}
+
+// 当前周期已用电量 = 已结明细累计桶（与明细 7 天保留期无关，只增不减）
 // + 未结运行段实时折算（周期起点之后的功率×时长，重启折算上限 1h）。
 // 跨周期运行段只计入本周期内的部分，不会因结段时刻落在新周期而整段计入新周期。
 function computeUsage(quota, at = new Date()) {
@@ -217,17 +390,25 @@ function computeUsage(quota, at = new Date()) {
   const atMs = at.getTime()
   const wEnd = Math.min(endMs, atMs)
   let v = 0
-  const recs = quota.scope === 'room'
-    ? stmts.recRoom.all(quota.target_name, new Date(wEnd).toISOString(), start.toISOString())
-    : stmts.recDevice.all(quota.device_id, new Date(wEnd).toISOString(), start.toISOString())
-  for (const r of recs) {
-    const rStart = new Date(r.start_time).getTime()
-    const rEnd = new Date(r.end_time).getTime()
-    if (rEnd <= rStart) continue
-    const s = Math.max(rStart, startMs)
-    const e = Math.min(rEnd, wEnd)
-    if (e > s) v += r.kwh * ((e - s) / (rEnd - rStart))
+
+  if (quota.id) {
+    const row = stmts.getUsage.get(quota.id, quota.period, start.toISOString())
+    if (row) v += row.settled_kwh
+  } else {
+    // 临时对象（播种时额度尚未落库，无 id/桶）：退化为直接聚合现存明细
+    const recs = quota.scope === 'room'
+      ? stmts.recRoom.all(quota.target_name, new Date(wEnd).toISOString(), start.toISOString())
+      : stmts.recDevice.all(quota.device_id, new Date(wEnd).toISOString(), start.toISOString())
+    for (const r of recs) {
+      const rStart = new Date(r.start_time).getTime()
+      const rEnd = new Date(r.end_time).getTime()
+      if (rEnd <= rStart) continue
+      const s = Math.max(rStart, startMs)
+      const e = Math.min(rEnd, wEnd)
+      if (e > s) v += r.kwh * ((e - s) / (rEnd - rStart))
+    }
   }
+
   const segs = quota.scope === 'room'
     ? stmts.segRoom.all(quota.target_name)
     : stmts.segDevice.all(quota.device_id)
@@ -256,6 +437,10 @@ export function evaluateAll(at = new Date()) {
   for (const q of quotas) {
     const { start, end } = periodRange(q.period, at)
     const startIso = start.toISOString()
+
+    // 先把本节拍新结落的明细增量计入累计桶（停用期间也照常记账，
+    // 重新启用后周期用量连续，不因停用断档）
+    syncUsage(q, at)
 
     // 跨周期 / 换周期：不属于当前周期身份的未关闭告警，按其旧周期快照结存关闭
     // （周期调整造成的身份切换写「调整周期」，自然跨周期写「周期结束」）
@@ -415,6 +600,11 @@ export function updateQuota(id, { limit_kwh, period, enabled, reason = '' }) {
   if (nextPeriod !== q.period) changes.push(`周期 ${PERIOD_LABEL[q.period]}→${PERIOD_LABEL[nextPeriod]}`)
   if (nextEnabled !== q.enabled) changes.push(nextEnabled ? '已启用' : '已停用')
   stmts.updateQuota.run(round4(nextLimit), nextPeriod, nextEnabled, at.toISOString(), id)
+  if (nextPeriod !== q.period) {
+    // 新粒度若曾用过（切走又切回），游标会跳过其桶覆盖期间的明细：
+    // 删除新粒度游标，随后评估走全量重建；旧粒度桶保留为历史留存
+    stmts.delCursorPeriod.run(id, nextPeriod)
+  }
   stmts.insertAdj.run(id, nextEnabled !== q.enabled ? (nextEnabled ? 'enable' : 'disable') : 'update',
     q.limit_kwh, round4(nextLimit), q.period, nextPeriod,
     reason || changes.join('，'), at.toISOString())
