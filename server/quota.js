@@ -7,6 +7,9 @@
 // 预警可升级为超标（不重复打扰）；额度上调后误报自动解除、下调后重新越线可重开重报；
 // 告警保留 待处理→处理中→已处理/已忽略 状态与备注；额度调整留痕可追溯；
 // 跨周期旧告警自动结转关闭、换周期旧周期告警按快照结存；额度停用/删除后未关闭告警自动解除。
+//
+// 周期累计口径：已完成自然日读 energy_daily_* 日固化表（不随 7 天明细清理减少），
+// 当前日读已结明细 + 未结段实时折算（详见 computeUsage）。
 
 const TICK_MS = 30_000          // 与 energy.js 模拟节拍一致：持续聚合、及时触发
 const WARN_RATIO = 0.8          // 用量达额度 80% 预警
@@ -14,7 +17,7 @@ const MAX_LIVE_MS = 3600_000    // 未结段实时折算最长补 1h（服务重
 
 // 区间分摊口径与 energy.js 完全一致：跨周期的已结段按重叠时长比例计入周期窗口，
 // 未结运行段同样按 [周期起点, now] 折算——跨周期段不再被整段计入新周期造成虚高误报
-import { round4 } from './prorate.js'
+import { round4, dayKey } from './prorate.js'
 
 const PERIOD_LABEL = { daily: '每日', weekly: '每周', monthly: '每月' }
 const STATUS_LABEL = { open: '待处理', handling: '处理中', resolved: '已处理', ignored: '已忽略' }
@@ -150,7 +153,11 @@ export function initQuota(database, notifyFn) {
     allAdj: db.prepare(`SELECT a.*, q.scope, q.target_name FROM quota_adjustments a
                         LEFT JOIN energy_quotas q ON q.id=a.quota_id
                         ORDER BY a.id DESC LIMIT 50`),
-    // 取「与周期窗口相交」的已结段（不能只按 end_time 过滤），用量在 computeUsage 内按重叠时长分摊
+    // 周期内「已完成自然日」的用量读固化日表（不受 7 天明细清理影响）；
+    // 当前日仍直接读明细+未结段实时折算（明细在当日不会被清理）。
+    dailyRoom: db.prepare('SELECT COALESCE(SUM(kwh),0) v FROM energy_daily_room WHERE room=? AND day>=? AND day<?'),
+    dailyDevice: db.prepare('SELECT COALESCE(SUM(kwh),0) v FROM energy_daily_device WHERE device_id=? AND day>=? AND day<?'),
+    // 当前日明细（start_time < 窗口终点），用量在 computeUsage 内按重叠时长分摊
     recRoom: db.prepare('SELECT * FROM energy_records WHERE room=? AND start_time < ? AND end_time > ?'),
     recDevice: db.prepare('SELECT * FROM energy_records WHERE device_id=? AND start_time < ? AND end_time > ?'),
     segRoom: db.prepare('SELECT * FROM energy_segments WHERE room=?'),
@@ -207,8 +214,11 @@ export function periodRange(period, at = new Date()) {
   return { start, end }
 }
 
-// 当前周期已用电量 = 已结分段（按与周期窗口的重叠时长分摊）
-// + 未结运行段实时折算（周期起点之后的功率×时长，重启折算上限 1h）。
+// 当前周期已用电量
+// = 周期起点至「当前自然日之前」所有已完成日的固化用量（energy_daily_*，
+//   明细 7 天清理不会动它，月/周累计因此不随历史明细清理而减少）
+// + 当前日已结分段按重叠时长分摊（当日明细尚未清理）
+// + 未结运行段实时折算（功率×时长，重启折算上限 1h）。
 // 跨周期运行段只计入本周期内的部分，不会因结段时刻落在新周期而整段计入新周期。
 function computeUsage(quota, at = new Date()) {
   const { start, end } = periodRange(quota.period, at)
@@ -216,18 +226,31 @@ function computeUsage(quota, at = new Date()) {
   const endMs = end.getTime()
   const atMs = at.getTime()
   const wEnd = Math.min(endMs, atMs)
+
+  const todayIso = dayKey(atMs)
+  const startIso = start.toISOString()
   let v = 0
+  // 已完成自然日：周期起点 ≤ day < 今日零点。daily 周期起点即今日零点，
+  // 区间为空返回 0；weekly/monthly 则由日表覆盖明细已被清理的早期日期。
+  v += quota.scope === 'room'
+    ? stmts.dailyRoom.get(quota.target_name, startIso, todayIso).v
+    : stmts.dailyDevice.get(quota.device_id, startIso, todayIso).v
+
+  // 当前日：直接读当日已结明细（按与 [今日零点, wEnd) 的重叠时长分摊），
+  // 保证当日结段立即反映；日表的今日行刻意不读，避免同一用量重复计算。
+  const todayMs = new Date(todayIso).getTime()
   const recs = quota.scope === 'room'
-    ? stmts.recRoom.all(quota.target_name, new Date(wEnd).toISOString(), start.toISOString())
-    : stmts.recDevice.all(quota.device_id, new Date(wEnd).toISOString(), start.toISOString())
+    ? stmts.recRoom.all(quota.target_name, new Date(wEnd).toISOString(), todayIso)
+    : stmts.recDevice.all(quota.device_id, new Date(wEnd).toISOString(), todayIso)
   for (const r of recs) {
     const rStart = new Date(r.start_time).getTime()
     const rEnd = new Date(r.end_time).getTime()
     if (rEnd <= rStart) continue
-    const s = Math.max(rStart, startMs)
+    const s = Math.max(rStart, todayMs)
     const e = Math.min(rEnd, wEnd)
     if (e > s) v += r.kwh * ((e - s) / (rEnd - rStart))
   }
+  // 未结运行段实时折算（周期起点之后的当前功率×时长，重启最长补 1h）
   const segs = quota.scope === 'room'
     ? stmts.segRoom.all(quota.target_name)
     : stmts.segDevice.all(quota.device_id)

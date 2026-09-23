@@ -19,6 +19,18 @@ export function hourFloor(ms) {
   return d.getTime()
 }
 
+// 本地时区自然日零点
+export function dayFloor(ms) {
+  const d = new Date(ms)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+// 自然日键（本地零点 ISO）：按日留存累计用量的稳定身份，跨设备/房间通用
+export function dayKey(ms) {
+  return new Date(dayFloor(ms)).toISOString()
+}
+
 // 把 [startMs,endMs) 按本地整点切成若干分片，附该片占原区间的时长比例
 export function splitByHour(startMs, endMs) {
   const parts = []

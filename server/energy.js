@@ -6,7 +6,7 @@
 // 同时冗余产生该段用电时的设备名 / 房间名快照与完整 ISO 起止时间：
 // 改名、换房只影响之后的段，历史始终归属产生它的名字与房间。
 
-import { round4, HOUR_MS, splitByHour, kwhInWindow, forEachHourSlice } from './prorate.js'
+import { round4, HOUR_MS, splitByHour, kwhInWindow, forEachHourSlice, dayKey } from './prorate.js'
 
 const SEG_TICK_MS = 30_000          // 模拟设备运行：每 30s 结段并续开，用电持续落库
 const KEEP_MS = 7 * 24 * 3600_000   // 分段明细保留 7 天
@@ -40,6 +40,24 @@ export function initEnergy(database) {
     watts INTEGER NOT NULL,
     start_time TEXT NOT NULL
   );
+  -- 按「自然日 × 对象」固化的已结分段用量（本地零点 ISO 为日键）。
+  -- energy_records 明细只保留 7 天，而月/周周期比 7 天长：周期累计若只读明细，
+  -- 旧明细一被清理，周期用量就回落、超线告警被误判解除。日用量一旦结落即在此
+  -- 留底，不随明细清理而消失；当前日仍直接读明细+未结段实时折算（见 quota.js）。
+  -- 房间按产生用电时的房间名快照归并（room TEXT），设备按稳定 device_id 归并。
+  CREATE TABLE IF NOT EXISTS energy_daily_room (
+    day TEXT NOT NULL,                 -- 该自然日本地零点 ISO
+    room TEXT NOT NULL,
+    kwh REAL NOT NULL,
+    PRIMARY KEY (day, room)
+  ) WITHOUT ROWID;
+  CREATE TABLE IF NOT EXISTS energy_daily_device (
+    day TEXT NOT NULL,
+    device_id INTEGER NOT NULL,        -- 稳定标识；删除设备不级联，历史累计保留
+    kwh REAL NOT NULL,
+    PRIMARY KEY (day, device_id)
+  ) WITHOUT ROWID;
+  CREATE INDEX IF NOT EXISTS idx_energy_daily_device ON energy_daily_device(device_id, day);
   `)
   stmts = {
     deviceById: db.prepare(
@@ -51,13 +69,22 @@ export function initEnergy(database) {
     upsertSeg: db.prepare(`INSERT OR REPLACE INTO energy_segments
       (device_id,device_name,room,watts,start_time) VALUES (?,?,?,?,?)`),
     insertRec: db.prepare(`INSERT INTO energy_records
-      (device_id,device_name,room,watts,kwh,start_time,end_time,hour) VALUES (?,?,?,?,?,?,?,?)`)
+      (device_id,device_name,room,watts,kwh,start_time,end_time,hour) VALUES (?,?,?,?,?,?,?,?)`),
+    upsertDailyRoom: db.prepare(`INSERT INTO energy_daily_room (day,room,kwh) VALUES (?,?,?)
+      ON CONFLICT(day,room) DO UPDATE SET kwh=kwh+excluded.kwh`),
+    upsertDailyDevice: db.prepare(`INSERT INTO energy_daily_device (day,device_id,kwh) VALUES (?,?,?)
+      ON CONFLICT(day,device_id) DO UPDATE SET kwh=kwh+excluded.kwh`),
+    dailyRoomCount: db.prepare('SELECT COUNT(*) c FROM energy_daily_room'),
+    dailyDeviceCount: db.prepare('SELECT COUNT(*) c FROM energy_daily_device')
   }
 
-  // 初始化顺序：迁移旧数据 → 重启恢复（补结上次未结段、清空段表）
+  // 初始化顺序：回填历史日用量固化表 → 迁移旧数据 → 重启恢复（补结上次未结段、清空段表）
   // → 首次播种 → 按设备当前状态重建运行段。
-  // 必须先恢复后播种：段首是本次启动时刻，若先播种再恢复，补结会把旧段
-  // （含服务停机区间）以当前快照错误地算到播种窗口里。
+  // 回填必须最先：日用量表此前不存在的旧库，在任何新明细插入前，用现存明细
+  // （含旧版未拆长段）一次性按自然日分摊补齐；回填之后的迁移/恢复/播种全部走
+  // insertRecord 同步累计，绝不重复计。恢复仍须早于播种：段首是本次启动时刻，
+  // 若先播种再恢复，补结会把旧段（含服务停机区间）以当前快照错误地算到播种窗口里。
+  backfillDailyFromRecords()
   migrateLegacyEnergy()
   recoverOnStartup()
   seedEnergy()
@@ -80,6 +107,89 @@ function openSeg(d, at) {
   stmts.upsertSeg.run(d.id, d.name, d.room, d.watts, at.toISOString())
 }
 
+// 明细插入的唯一入口：落 energy_records 的同时把用量按自然日累计进固化表，
+// 保证周期累计不随 7 天明细清理而减少。入参段可能跨自然日（旧版迁移行），
+// 先按本地零点拆成单日分片，再逐日落明细与日累计。
+function insertRecord(base, startMs, endMs, kwh, watts) {
+  if (!(kwh > 0) || endMs <= startMs) return
+  const w = watts ?? base.watts
+  let s = startMs
+  while (s < endMs) {
+    const d0 = new Date(s); d0.setHours(0, 0, 0, 0)
+    const e = Math.min(endMs, d0.getTime() + 24 * 3600_000)
+    const part = round4(kwh * ((e - s) / (endMs - startMs)))
+    if (part > 0) {
+      const start = new Date(s)
+      stmts.insertRec.run(base.device_id, base.device_name, base.room, w, part,
+        start.toISOString(), new Date(e).toISOString(), start.getHours())
+      accDaily(base.device_id, base.room, s, part)
+    }
+    s = e
+  }
+}
+
+// 把一段已结用量按自然日累计进固化表（房间快照 + 稳定设备标识各一份）
+function accDaily(deviceId, room, startMs, kwh) {
+  if (!(kwh > 0)) return
+  const day = dayKey(startMs)
+  stmts.upsertDailyRoom.run(day, room, kwh)
+  if (deviceId != null) stmts.upsertDailyDevice.run(day, deviceId, kwh)
+}
+
+// 旧库一次性回填：energy_daily_* 为空且存在明细时，按每条记录的完整起止时间
+// 以「功率×重叠时长」拆分到它覆盖的每个自然日（与周期分摊同一口径），
+// 兼容旧版未拆的长段、watts=0 的迁移行（按 kWh 时间比例分摊）。
+// 只回填一次：此后新结段都走 insertRecord 同步累计，重复执行不会双倍计。
+function backfillDailyFromRecords() {
+  const roomRows = stmts.dailyRoomCount.get()
+  const devRows = stmts.dailyDeviceCount.get()
+  const recCount = db.prepare('SELECT COUNT(*) c FROM energy_records').get().c
+  if (recCount === 0 || roomRows.c > 0 || devRows.c > 0) return
+
+  const rows = db.prepare('SELECT * FROM energy_records').all()
+  const roomAgg = new Map()   // room -> Map(day -> kwh)
+  const devAgg = new Map()    // device_id -> Map(day -> kwh)
+  const add = (map, key, day, kwh) => {
+    let m = map.get(key)
+    if (!m) { m = new Map(); map.set(key, m) }
+    m.set(day, (m.get(day) || 0) + kwh)
+  }
+  for (const r of rows) {
+    const rStart = new Date(r.start_time).getTime()
+    const rEnd = new Date(r.end_time).getTime()
+    if (rEnd <= rStart) continue
+    let s = rStart
+    // 逐自然日切分，按落在当日的时长比例分摊已有 kWh
+    while (s < rEnd) {
+      const d0 = new Date(s); d0.setHours(0, 0, 0, 0)
+      const nextDay = d0.getTime() + 24 * 3600_000
+      const e = Math.min(rEnd, nextDay)
+      const part = r.kwh * ((e - s) / (rEnd - rStart))
+      if (part > 0) {
+        const day = new Date(d0).toISOString()
+        add(roomAgg, r.room, day, part)
+        if (r.device_id != null) add(devAgg, r.device_id, day, part)
+      }
+      s = e
+    }
+  }
+  db.exec('BEGIN')
+  try {
+    for (const [room, days] of roomAgg)
+      for (const [day, v] of days) stmts.upsertDailyRoom.run(day, room, round4(v))
+    for (const [deviceId, days] of devAgg)
+      for (const [day, v] of days) stmts.upsertDailyDevice.run(day, deviceId, round4(v))
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+  db.prepare('INSERT INTO device_logs (device_name,action,detail,time) VALUES (?,?,?,?)')
+    .run('系统', '固化周期用量',
+      `已按自然日从历史明细回填周期累计用量（${rows.length} 条明细），月/周用量不再随明细清理减少`,
+      new Date().toLocaleString('zh-CN'))
+}
+
 // 落库一段 [startMs,endMs) 的用电：跨本地整点自动拆行，每个分片携带各自的
 // 功率×时长 kWh。自然日 / 周（周一起）/ 月边界全部落在整点上，因此拆行后
 // 任何周期窗口都能严格按区间取数，跨周期段不会整段掉进新周期。
@@ -87,10 +197,7 @@ function insertSegKwh(base, startMs, endMs, totalKwh) {
   for (const p of splitByHour(startMs, endMs)) {
     const kwh = round4(totalKwh * p.frac)
     if (kwh <= 0) continue
-    const start = new Date(p.start)
-    const end = new Date(p.end)
-    stmts.insertRec.run(base.device_id, base.device_name, base.room, base.watts, kwh,
-      start.toISOString(), end.toISOString(), start.getHours())
+    insertRecord(base, p.start, p.end, kwh)
   }
 }
 
@@ -160,7 +267,6 @@ function migrateLegacyEnergy() {
   if (rows.length) {
     const findByName = db.prepare('SELECT id FROM devices WHERE name=? ORDER BY id')
     const now = new Date()
-    const ins = stmts.insertRec
     let unbound = 0
     db.exec('BEGIN')
     try {
@@ -174,8 +280,10 @@ function migrateLegacyEnergy() {
         end.setMinutes(0, 0, 0)
         end.setHours(end.getHours() - ((end.getHours() - r.hour + 24) % 24))
         const start = new Date(end.getTime() - 3600_000)
-        ins.run(deviceId, r.device_name, r.room, 0, r.kwh,
-          start.toISOString(), end.toISOString(), start.getHours())
+        // 统一入口：明细落库的同时按自然日累计进周期用量固化表
+        insertRecord(
+          { device_id: deviceId, device_name: r.device_name, room: r.room, watts: 0 },
+          start.getTime(), end.getTime(), r.kwh, 0)
       }
       db.exec('DROP TABLE energy')
       db.exec('COMMIT')
@@ -206,9 +314,9 @@ function seedEnergy() {
     if (endMs <= startMs) return
     const kwh = round4((d.watts * (endMs - startMs)) / 3_600_000_000)
     if (kwh <= 0) return
-    const end = new Date(endMs)
-    stmts.insertRec.run(d.id, d.name, d.room, d.watts, kwh,
-      new Date(startMs).toISOString(), end.toISOString(), end.getHours())
+    // 统一入口：播种明细同样进入按日固化累计，保证新库周期用量自始自终不缺
+    insertRecord({ device_id: d.id, device_name: d.name, room: d.room, watts: d.watts },
+      startMs, endMs, kwh, d.watts)
   }
   db.exec('BEGIN')
   try {
